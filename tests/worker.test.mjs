@@ -12,9 +12,10 @@ async function req(method, path, { body, key, headers = {} } = {}) {
 const up = async p => (await fetch(U + p)).json();
 const gen = (over = {}, params = {}) => ({ model: "nai-diffusion-4-5-full", action: "generate", input: "1girl, smile", promptBase: "x", artist: "y", promptHash: "z",
   parameters: { width: 832, height: 1216, steps: 28, scale: 5, n_samples: 1, seed: 1, sampler: "k_euler_ancestral", noise_schedule: "karras", negative_prompt: "", ...params }, ...over });
+const ip = n => ({ "CF-Connecting-IP": "203.0.113." + n });
 
 let r;
-console.log("[1] 无密钥 / 空库");
+console.log("[1] 匿名关闭时");
 ok((await req("GET", "/api/yesnai/models")).s === 401, "models 无密钥 401");
 ok((await req("POST", "/api/yesnai/generate", { body: gen() })).s === 401, "generate 无密钥 401");
 ok((await req("GET", "/api/accounts", { key: "wrong" })).s === 401, "错误密钥 401");
@@ -33,14 +34,65 @@ await req("PATCH", "/api/accounts/" + aliceId, { key: KEY, body: { label: "主�
 r = await req("GET", "/api/prompt/status", { key: KEY });
 ok(r.j && r.j.configured === false && "model" in r.j, "prompt/status 返回真实对象", r.text);
 
-console.log("[3] 会话");
+console.log("[3] 匿名配置");
+r = await req("PUT", "/api/anon/config", { key: KEY, body: { enabled: true, per_ip_per_minute: 2, per_ip_daily: 3, global_daily: 5, models: ["nai-diffusion-4-5-full", "nai-diffusion-5-full"] } });
+ok(r.s === 200 && r.j.enabled && r.j.models.length === 1 && r.j.models[0] === "nai-diffusion-4-5-full", "开启；非免费模型被剔除", r.text);
+r = await req("PUT", "/api/anon/config", { body: { enabled: true } });
+ok(r.s === 401, "无密钥不能改配置");
 r = await req("GET", "/api/session");
-ok(r.j.admin_authenticated === false && r.j.accounts === undefined, "session：无密钥时不暴露账号数", r.text);
+ok(r.j.anon.enabled && r.j.admin_authenticated === false && r.j.accounts === undefined, "session：访客视角", r.text);
 r = await req("GET", "/api/session", { key: KEY });
 ok(r.j.admin_authenticated === true && r.j.accounts === 1, "session：管理员视角");
-let L, g;
+r = await req("GET", "/api/yesnai/models");
+ok(r.s === 200 && r.j.data.map(m => m.id).join() === "nai-diffusion-4-5-full", "访客模型列表只含允许的免费模型", r.text);
 
-console.log("[4] 网关密钥");
+console.log("[4] 匿名生图约束");
+// 每分钟限流按自然分钟分桶：离整分钟太近就等到下一分钟再开始（第 4、5 节的 IP1 请求要落在同一分钟），避免跨分钟导致误判
+if (new Date().getSeconds() > 45) await new Promise(r => setTimeout(r, (61 - new Date().getSeconds()) * 1000));
+await up("/__reset");
+r = await req("POST", "/api/yesnai/generate", { body: gen(), headers: ip(1) });
+ok(r.s === 200 && r.j.images?.length === 1, "合规请求 200", r.text.slice(0, 200));
+ok(r.h.get("X-Anon-Remaining-Today") === "2", "剩余额度头 = 2", r.h.get("X-Anon-Remaining-Today"));
+let L = await up("/__log"); let g = L.find(x => x.url === "/v1/nai/generate-image"); let gb = JSON.parse(g.body);
+ok(g.auth === "Bearer ynai-a", "用账号池 token 调上游");
+ok(!("promptBase" in gb) && gb.parameters.n_samples === 1 && gb.action === "generate", "请求体被清洗为干净文生图", g.body);
+ok(!g.headers["x-access-key"] && !g.headers["cf-connecting-ip"], "不向上游泄露访客/密钥头");
+for (const [desc, body] of [["步数 40", gen({}, { steps: 40 })], ["付费模型", gen({ model: "nai-diffusion-5-full" })], ["图生图", gen({ action: "img2img" })], ["1216×1216", gen({}, { width: 1216, height: 1216 })], ["尺寸非 64 倍数", gen({}, { width: 830 })]]) {
+  r = await req("POST", "/api/yesnai/generate", { body, headers: ip(2) });
+  ok(r.s === 400, "拒绝：" + desc, r.text);
+}
+r = await req("POST", "/api/yesnai/generate", { body: gen({}, { image: "AAAA", mask: "BBBB", reference_image_multiple: ["x"] }), headers: ip(2) });
+L = await up("/__log"); gb = JSON.parse(L.filter(x => x.url === "/v1/nai/generate-image").pop().body);
+ok(r.s === 200 && !("image" in gb.parameters) && !("reference_image_multiple" in gb.parameters), "图片/参考图字段被丢弃");
+r = await req("POST", "/api/yesnai/generate", { body: gen(), headers: { ...ip(1), Origin: "https://evil.example" } });
+ok(r.s === 403, "跨站 Origin 被拒", r.text);
+
+console.log("[5] 限流");
+r = await req("POST", "/api/yesnai/generate", { body: gen(), headers: ip(1) });
+ok(r.s === 200, "IP1 第 2 张（每分钟 2）");
+r = await req("POST", "/api/yesnai/generate", { body: gen(), headers: ip(1) });
+ok(r.s === 429 && /每分钟/.test(r.j?.error?.message), "IP1 第 3 张触发每分钟限流", r.text);
+r = await req("POST", "/api/yesnai/generate", { body: gen(), headers: ip(3) });
+ok(r.s === 200, "IP3 正常");
+r = await req("POST", "/api/yesnai/generate", { body: gen(), headers: ip(4) });
+ok(r.s === 200, "IP4 正常（全站第 5 张）");
+r = await req("POST", "/api/yesnai/generate", { body: gen(), headers: ip(5) });
+ok(r.s === 429 && /全站/.test(r.j?.error?.message), "全站日上限 5 生效", r.text);
+r = await req("GET", "/api/anon/config", { key: KEY });
+ok(r.j.today.used === 5 && r.j.today.visitors === 4, "今日用量统计", JSON.stringify(r.j.today));
+
+console.log("[6] 计费熔断");
+await req("PUT", "/api/anon/config", { key: KEY, body: { global_daily: 100 } });
+await up("/__cost/12");
+r = await req("POST", "/api/yesnai/generate", { body: gen(), headers: ip(6) });
+ok(r.s === 200, "被计费的那次仍返回图片");
+r = await req("GET", "/api/anon/config", { key: KEY });
+ok(r.j.enabled === false && /12 Gems/.test(r.j.disabled_reason), "自动关闭并记录原因", r.j.disabled_reason);
+ok((await req("POST", "/api/yesnai/generate", { body: gen(), headers: ip(7) })).s === 401, "熔断后访客 401");
+r = await req("PUT", "/api/anon/config", { key: KEY, body: { enabled: true } });
+ok(r.j.enabled && !r.j.disabled_reason, "站长手动重开清除熔断原因");
+
+console.log("[7] 网关密钥");
 r = await req("POST", "/api/gateway/keys", { key: KEY, body: { name: "rp", allowed_models: ["nai-diffusion-4-5-full"], daily_requests: 2 } });
 const gk = r.j.key; ok(/^yst-/.test(gk), "创建网关密钥");
 const chat = (k, model = "nai-diffusion-4-5-full") => fetch(B + "/v1/chat/completions", { method: "POST", headers: { Authorization: "Bearer " + k, "Content-Type": "application/json" }, body: JSON.stringify({ model, messages: [{ role: "user", content: "1girl, smile" }] }) });
@@ -62,7 +114,7 @@ r = await req("GET", "/api/tokens", { key: KEY }); const lrow = r.j.items.find(x
 r = await req("GET", "/api/gateway/keys", { key: KEY }); const grow = r.j.items.find(x => x.key === gk);
 ok(lrow.use_count === 1 && grow.use_count === 4, "旧密钥计数记在 api_tokens，不串到网关密钥", `legacy=${lrow.use_count} gw=${grow.use_count}`);
 
-console.log("[5] 自动签到");
+console.log("[8] 自动签到");
 await req("PATCH", "/api/autocheckin/settings", { key: KEY, body: { weekday_times: ["00:00", "00:01"], weekend_times: ["00:00", "00:01"] } });
 await up("/__reset");
 for (let i = 0; i < 3; i++) await fetch(B + "/cdn-cgi/local/scheduled");
@@ -73,7 +125,7 @@ ok(Array.isArray(r.j.results), "cron 跑完立刻手动测试不被租约挡住"
 r = await req("POST", "/api/accounts/" + aliceId + "/test", { key: KEY });
 ok(r.j.ok === true, "单账号手动测试在今天已签后仍可强制执行", r.text);
 
-console.log("[6] 公共广场");
+console.log("[9] 公共广场");
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 const mk = async (prompt, disclosed) => { const a = await req("POST", "/api/gallery", { key: KEY, body: { image: png, fmt: "png", meta: { prompt, steps: 28, scale: 5 } } }); await req("POST", `/api/gallery/${a.j.id}/publish`, { key: KEY, body: { title: "作品" + (disclosed ? "A" : "B"), promptDisclosed: disclosed, paramsDisclosed: disclosed } }); return a.j.id; };
 await mk("hiddenword cat", false); await mk("openword dog", true);
@@ -90,7 +142,7 @@ ok(det.params && det.params.steps === 28 && det.params.scale === 5, "公开参�
 const th = await fetch(B + "/pub/gallery/i/" + shown.id + "?t=thumb");
 ok(th.status === 200 && th.headers.get("content-type") === "image/png", "无缩略图时回退原图", th.status);
 
-console.log("[7] 画廊二进制上传 / 批量清空");
+console.log("[10] 画廊二进制上传 / 批量清空");
 const bin = Buffer.from(png, "base64");
 const fd = new FormData();
 fd.append("image", new Blob([bin], { type: "image/png" }), "image.png");
@@ -107,7 +159,7 @@ ok(r.j.items[0]?.params_json === "", "超长 params_json 不再存成截断的�
 r = await req("POST", "/api/gallery/clear", { key: KEY, body: { confirm: true } });
 ok(r.s === 200 && r.j.deleted === 4, "批量清空 R2（2 张 JSON 上传原图 + 1 张 multipart 原图与缩略图）", r.text);
 
-console.log("[8] 生图 Token 失效自动重建（限频）");
+console.log("[11] 生图 Token 失效自动重建（限频）");
 await up("/__reset");
 r = await req("POST", "/api/accounts", { key: KEY, body: { username: "bob", password: "p", api_token: "ynai-bad" } });
 const bobId = r.j.id;
@@ -123,7 +175,7 @@ L = await up("/__log");
 ok(tr.status !== 200 && L.filter(x => x.url === "/api/ynai/tokens").length === 0, "6 小时内不再重复新建上游 Token", tr.status);
 await req("PATCH", "/api/accounts/" + aliceId, { key: KEY, body: { enabled: true } });
 
-console.log("[9] 自动轮询 / 图片工具路由");
+console.log("[12] 自动轮询 / 图片工具路由");
 await req("PATCH", "/api/accounts/" + bobId, { key: KEY, body: { api_token: "ynai-bob2" } });
 await up("/__reset");
 const autoGen = () => fetch(B + "/api/yesnai/generate", { method: "POST", headers: { "X-Access-Key": KEY, "X-Account-Id": "auto", Origin: B, "Content-Type": "application/json" }, body: JSON.stringify(gen()) });
@@ -136,7 +188,7 @@ r = await req("GET", "/api/ai/generate-image/suggest-tags?prompt=1girl&model=nai
 ok(r.s === 200 && r.j?.tags, "suggest-tags 路由可用", r.s);
 
 
-console.log("[10] 免费计划：子请求分批 / 流式计费 / 汇总统计 / 分页不数总数");
+console.log("[13] 免费计划：子请求分批 / 流式计费 / 汇总统计 / 分页不数总数");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let stats0 = (await req("GET", "/api/stats", { key: KEY })).j.today;
 await up("/__cost/7"); await up("/__big/3");

@@ -352,7 +352,7 @@ async function selfCheck(site, key) {
     if (!s) await new Promise(r => setTimeout(r, 3000));   // 新域名 / 新 Worker 生效可能要几秒
   }
   if (!s) return warn(`暂时访问不到 ${site}（新域名生效可能需要一两分钟；*.workers.dev 在部分网络需代理）`);
-  info(c.g("网站已响应") + c.d(`  · 访问密钥${s.access_key_required ? "已启用" : c.y("未启用")}`));
+  info(c.g("网站已响应") + c.d(`  · 访问密钥${s.access_key_required ? "已启用" : c.y("未启用")} · 匿名模式${s.anon?.enabled ? "已开启" : "关闭"}`));
   if (!key) return;
   try {
     const r = await fetch(site + "/api/accounts", { headers: { "X-Access-Key": key }, signal: AbortSignal.timeout(10000) });

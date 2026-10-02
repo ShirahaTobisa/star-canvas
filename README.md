@@ -35,6 +35,7 @@ python serve.py
 - **自动签到**：工作日/周末多时间槽 × 时区（IANA）；补签错过的槽；失败重试 30 分钟退避、每槽最多 1+4 次；401→自动重登→仍失败标 `jwt_expired`；Turnstile 标 `manual_required` 提示人工，绝不绕过
 - 报价 / 余额 / 一键签到；历史记录只存参数（localStorage）
 - **中文智能提示词**：输入中文画面描述后，在设置中配置 OpenAI 兼容 Prompt API，即可一键转换为英文 NovelAI/booru Tags；当前版本未配置外部 API 时不会自动使用内置词典回退。
+- **匿名模式（云端 · 默认关闭）**：站长开启后，没有访问密钥的访客也能直接打开页面免费生图——只限免费模型、≤28 步、≤1024×1024 像素、单张纯文生图；每 IP 每分钟 / 每 IP 每天 / 全站每天三层限流；若上游意外计费自动熔断关闭。详见下文「匿名模式」。
 - **对外接入（new-api 式）**：`POST /v1/images/generations`、`POST /v1/chat/completions`、`GET /v1/models`；支持 `yst-` 分发密钥、中文自动转 Tag 与账号池轮询
 
 ## 本地模式说明
@@ -69,11 +70,11 @@ python serve.py
 
 ## Cloudflare 部署（手动 · 多账号 + R2 画廊）
 
-文件结构：`public/`（前端 + `_headers` 安全头）、`worker/index.ts`（路由/调度/加密）、`migrations/`（`0001`–`0014` 全部 D1 迁移）、`wrangler.jsonc`。
+文件结构：`public/`（前端 + `_headers` 安全头）、`worker/index.ts`（路由/调度/加密）、`migrations/`（`0001`–`0015` 全部 D1 迁移）、`wrangler.jsonc`。
 
 > `wrangler.jsonc` 里的 `database_id` 是原作者账号下的库，部署到你自己的账号前，先用第 1 步建库并替换成你的 ID。
 >
-> **已部署过、只是升级代码**：先 `npx wrangler d1 migrations apply yesnai-studio --remote`（会补上 `0012`–`0014` 等新迁移），再 `npx wrangler deploy`。
+> **已部署过、只是升级代码**：先 `npx wrangler d1 migrations apply yesnai-studio --remote`（会补上 `0012`–`0015` 等新迁移），再 `npx wrangler deploy`。
 
 ```bash
 # 1. 建库与桶（database_id 填入 wrangler.jsonc）
@@ -127,6 +128,18 @@ curl -H "Authorization: Bearer $KEY" $BASE/v1/balance
 
 任何支持自定义 base URL 的工具把地址指到 Worker、密钥填 APP_ACCESS_KEY 即可。给别人用请发 `yst-` 分发密钥（可设模型白名单、参数上限、每日配额、并发），**不要发 APP_ACCESS_KEY**——它是站长全权密钥，也是账号凭据的加密密钥。`/v1/nai/generate-image`、`/v1/images/generations`、`/v1/chat/completions`、`GET /generate` 四个入口共用同一套密钥、策略、配额与用量日志。签到 Cron 已做错峰（账号顺序打散 + 每账号 3~8 秒随机间隔）。
 
+## 匿名模式（访客免费生图）
+
+站长在「设置 → 匿名模式」打开开关后，没有访问密钥的人打开页面即进入**访客模式**：
+
+- 只能用免费模型（NAI 4.5 Full / 4.5 Curated / 5 Curated，可在设置里勾选子集）、≤28 步、≤1024×1024 像素、单张、纯文生图；图生图、局部重绘、Vibe/角色参考、附加 JSON 一律不可用。服务端会把访客请求重建为干净的文生图 body，前端约束只是体验层。
+- 限流：每 IP 每分钟、每 IP 每天、全站每天三层原子计数（D1 `anon_usage`，按自动签到时区的零点重置；只存 IP 的加盐哈希，IPv6 按 /64 计）。账号池故障不扣访客额度。
+- 访客图片只显示在当前页面（不进 R2 画廊），访客看不到余额、签到、账号、用量、设置等任何管理功能。
+- **计费熔断**：若上游对访客请求返回 `cost_gems > 0`（例如上游调整了免费档规则），立即自动关闭匿名模式，并在设置里显示原因；复核后手动重新开启即可。
+- 站长在访客页面点「站长登录」填入 APP_ACCESS_KEY 即切回完整功能。
+
+需要先执行迁移 `0015_anon_mode.sql`；未执行时匿名生图会返回 503 提示。
+
 ## 免费计划（Workers Free）说明
 
 项目按 Cloudflare 免费计划的限制设计，几个关键点：
@@ -155,8 +168,9 @@ curl -H "Authorization: Bearer $KEY" $BASE/v1/balance
 | `/api/gallery/{id}` | DELETE | 删图（R2 两对象 + D1 行） |
 | `/api/gallery/clear` | POST | 清空（需 `{confirm:true}`） |
 | `/api/stats` · `/api/logs` | GET | 统计（读按天汇总表）/ 请求日志（返回 `has_more`，`?total=1` 才数总数） |
+| `/api/anon/config` | GET/PUT | 匿名模式配置（开关、三层限额、可用免费模型、访客公告）与今日用量 |
 
-除 `/api/session` 外全部要求 `X-Access-Key`；写操作另做 Origin 校验。
+除 `/api/session` 外全部要求 `X-Access-Key`；写操作另做 Origin 校验。匿名模式开启时，访客（无密钥）只能访问 `GET /api/yesnai/models`（只返回允许的免费模型）与 `POST /api/yesnai/generate`（免费档 + 限流）。
 
 ## 站点接口要点（详见 `_rev/api_docs_blocks.txt`，本地逆向产物不分发）
 

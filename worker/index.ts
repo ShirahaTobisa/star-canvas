@@ -1431,6 +1431,166 @@ function openaiModelList(up: any) {
   }
   return { object: "list", data };
 }
+/* ================= 匿名模式（访客免费档生图） ================= */
+// 访客不带访问密钥也能生图，但只限上游免费档：免费模型、≤28 步、≤1024×1024 像素、单张、纯文生图。
+// 防滥用：每 IP 每分钟 / 每 IP 每天 / 全站每天三层原子计数（D1 anon_usage，迁移 0015）。
+// 熔断：若上游对访客请求意外计费（cost_gems>0），立即自动关闭匿名模式并记录原因，等站长复核。
+const ANON_FREE_MODELS = ["nai-diffusion-4-5-full", "nai-diffusion-4-5-curated", "nai-diffusion-5-curated"];
+const ANON_MAX_STEPS = 28;
+const ANON_MAX_PIXELS = 1024 * 1024;
+const ANON_PROMPT_MAX = 6000;
+// 访客请求只透传这些生成参数；图生图/重绘/参考图/vibe 等一律丢弃
+const ANON_PARAM_ALLOW = new Set(["width", "height", "steps", "scale", "seed", "sampler", "noise_schedule", "negative_prompt", "v4_prompt", "v4_negative_prompt",
+  "cfg_rescale", "qualityToggle", "ucPreset", "params_version", "skip_cfg_above_sigma", "prefer_brownian", "use_coords", "legacy_uc", "characterPrompts", "dynamic_thresholding"]);
+interface AnonConfig { enabled: boolean; models: string[]; per_ip_per_minute: number; per_ip_daily: number; global_daily: number; notice: string; disabled_reason: string; disabled_at: string | null; }
+const ANON_DEFAULTS: AnonConfig = { enabled: false, models: [...ANON_FREE_MODELS], per_ip_per_minute: 3, per_ip_daily: 20, global_daily: 300, notice: "", disabled_reason: "", disabled_at: null };
+function clampInt(v: unknown, min: number, max: number, fallback: number) { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback; }
+function normalizeAnonConfig(raw: any): AnonConfig {
+  const c = raw && typeof raw === "object" ? raw : {};
+  const models: string[] = Array.isArray(c.models) ? c.models.map(String).filter((m: string) => ANON_FREE_MODELS.includes(m)) : [...ANON_FREE_MODELS];
+  return {
+    enabled: Boolean(c.enabled),
+    models: models.length ? [...new Set(models)] : [...ANON_FREE_MODELS],
+    per_ip_per_minute: clampInt(c.per_ip_per_minute, 1, 60, ANON_DEFAULTS.per_ip_per_minute),
+    per_ip_daily: clampInt(c.per_ip_daily, 1, 10000, ANON_DEFAULTS.per_ip_daily),
+    global_daily: clampInt(c.global_daily, 1, 1000000, ANON_DEFAULTS.global_daily),
+    notice: String(c.notice || "").slice(0, 300),
+    disabled_reason: String(c.disabled_reason || "").slice(0, 300),
+    disabled_at: c.disabled_at ? String(c.disabled_at) : null,
+  };
+}
+async function getAnonConfig(env: Env): Promise<AnonConfig> {
+  try {
+    const row = await env.DB.prepare("SELECT v FROM runtime_kv WHERE k='anon_config'").first<any>();
+    return normalizeAnonConfig(row?.v ? JSON.parse(row.v) : null);
+  } catch { return { ...ANON_DEFAULTS }; }
+}
+async function saveAnonConfig(env: Env, patch: any): Promise<AnonConfig> {
+  const current = await getAnonConfig(env);
+  const next = normalizeAnonConfig({ ...current, ...(patch && typeof patch === "object" ? patch : {}) });
+  if (patch?.enabled === true) { next.disabled_reason = ""; next.disabled_at = null; }   // 站长手动重新开启 = 复核完毕
+  await env.DB.prepare("INSERT INTO runtime_kv(k,v) VALUES('anon_config',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").bind(JSON.stringify(next)).run();
+  return next;
+}
+function anonPublic(c: AnonConfig) {
+  return { enabled: c.enabled, models: c.models, max_steps: ANON_MAX_STEPS, max_pixels: ANON_MAX_PIXELS, max_samples: 1,
+    per_ip_per_minute: c.per_ip_per_minute, per_ip_daily: c.per_ip_daily, notice: c.notice };
+}
+async function clientKey(request: Request, env: Env) {
+  let ip = String(request.headers.get("CF-Connecting-IP") || "").trim() || "unknown";
+  if (ip.includes(":")) ip = ip.split(":").slice(0, 4).join(":") + "::/64";   // IPv6 按 /64 计，防止换后缀绕过
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${env.APP_ACCESS_KEY || "ynai"}:anon:${ip}`));
+  return [...new Uint8Array(digest)].slice(0, 12).map(b => b.toString(16).padStart(2, "0")).join("");   // 只存哈希，不落原始 IP
+}
+async function anonDay(env: Env) {
+  const p = localParts(new Date(), (await getConfig(env)).timezone);   // 按站点时区零点重置
+  return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
+}
+// 原子占用一个计数桶：未满则 +1 并返回 true；已满返回 false
+async function takeBucket(env: Env, bucket: string, limit: number, ttlMs: number) {
+  const row = await env.DB.prepare(`INSERT INTO anon_usage(bucket,count,expires_at) VALUES(?,1,?)
+    ON CONFLICT(bucket) DO UPDATE SET count=count+1 WHERE count < ? RETURNING count`).bind(bucket, new Date(Date.now() + ttlMs).toISOString(), limit).first<any>();
+  return row != null;
+}
+async function refundBuckets(env: Env, buckets: string[]) {
+  for (const b of buckets) await env.DB.prepare("UPDATE anon_usage SET count=MAX(0,count-1) WHERE bucket=?").bind(b).run().catch(() => {});
+}
+async function anonReserve(env: Env, request: Request, c: AnonConfig) {
+  const who = await clientKey(request, env), day = await anonDay(env), minute = new Date().toISOString().slice(0, 16);
+  const plan: [string, number, number, string][] = [
+    [`m:${who}:${minute}`, c.per_ip_per_minute, 3 * 60_000, `访客每分钟最多 ${c.per_ip_per_minute} 张，请稍后再试`],
+    [`d:${who}:${day}`, c.per_ip_daily, 2 * 86_400_000, `今天的访客额度（${c.per_ip_daily} 张）已用完，明天再来吧`],
+    [`g:${day}`, c.global_daily, 2 * 86_400_000, "今天全站访客额度已用完，明天再来吧"],
+  ];
+  const taken: string[] = [];
+  try {
+    for (const [bucket, limit, ttl, message] of plan) {
+      if (!(await takeBucket(env, bucket, limit, ttl))) { await refundBuckets(env, taken); throw new HttpError(message, 429, "ANON_RATE_LIMITED"); }
+      taken.push(bucket);
+    }
+  } catch (e) {
+    if (e instanceof HttpError) throw e;
+    await refundBuckets(env, taken);
+    throw new HttpError("匿名模式未初始化（请应用数据库迁移 0015）", 503, "ANON_NOT_READY");
+  }
+  return { taken, dayLeft: async () => {
+    const r = await env.DB.prepare("SELECT count FROM anon_usage WHERE bucket=?").bind(`d:${who}:${day}`).first<any>().catch(() => null);
+    return Math.max(0, c.per_ip_daily - Number(r?.count || 0));
+  } };
+}
+// 把访客请求重建为干净的免费档文生图 body；不合规直接 400（前端已预先约束，这里是兜底）
+function anonSanitize(body: any, c: AnonConfig) {
+  const model = String(body?.model || "");
+  if (!c.models.includes(model)) throw new HttpError(`访客模式只能使用免费模型：${c.models.join(" / ")}`, 400, "ANON_MODEL_DENIED");
+  const action = String(body?.action || "generate");
+  if (action !== "generate") throw new HttpError("访客模式不支持图生图 / 局部重绘", 400, "ANON_ACTION_DENIED");
+  const input = Array.isArray(body?.input) ? body.input.map(String).join(", ") : String(body?.input || "");
+  if (!input.trim()) throw new HttpError("提示词不能为空", 400, "PROMPT_REQUIRED");
+  if (input.length > ANON_PROMPT_MAX) throw new HttpError(`提示词过长（访客上限 ${ANON_PROMPT_MAX} 字符）`, 400, "ANON_PROMPT_TOO_LONG");
+  const src = body?.parameters && typeof body.parameters === "object" && !Array.isArray(body.parameters) ? body.parameters : {};
+  const parameters: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(src)) if (ANON_PARAM_ALLOW.has(k)) parameters[k] = v;
+  const w = Number(parameters.width ?? 832), h = Number(parameters.height ?? 1216), steps = Number(parameters.steps ?? 28);
+  if (!Number.isInteger(w) || !Number.isInteger(h) || w < 64 || h < 64 || w % 64 || h % 64) throw new HttpError("尺寸需为 64 的整数倍", 400, "ANON_BAD_SIZE");
+  if (w * h > ANON_MAX_PIXELS) throw new HttpError("访客模式尺寸上限 1024×1024 像素（如 832×1216、1024×1024）", 400, "ANON_SIZE_DENIED");
+  if (!Number.isInteger(steps) || steps < 1 || steps > ANON_MAX_STEPS) throw new HttpError(`访客模式步数上限 ${ANON_MAX_STEPS}`, 400, "ANON_STEPS_DENIED");
+  Object.assign(parameters, { width: w, height: h, steps, n_samples: 1 });
+  if (JSON.stringify(parameters).length > 32_000) throw new HttpError("参数过大", 400, "ANON_PARAMS_TOO_LARGE");
+  return normalizeNaiBody({ model, action: "generate", input, parameters });
+}
+async function anonModels(env: Env) {
+  const c = await getAnonConfig(env);
+  if (!c.enabled) throw new HttpError("需要访问密钥（在设置里填写 APP_ACCESS_KEY）", 401, "ACCESS_KEY_REQUIRED");
+  const { response, data } = await upstreamJson(await yesnaiFetch(env, "/v1/models"));
+  if (!response.ok) throw new HttpError("模型列表获取失败", 502, "UPSTREAM_MODELS_FAILED");
+  const list = openaiModelList(data);
+  return json({ ...list, data: list.data.filter((m: any) => c.models.includes(m.id)) });
+}
+async function anonGenerate(request: Request, env: Env, ctx?: ExecutionContext) {
+  const c = await getAnonConfig(env);
+  if (!c.enabled) throw new HttpError("需要访问密钥（在设置里填写 APP_ACCESS_KEY）", 401, "ACCESS_KEY_REQUIRED");
+  requireOrigin(request, env);
+  if (Number(request.headers.get("Content-Length") || 0) > 256 * 1024) throw new HttpError("请求体过大", 413, "BODY_TOO_LARGE");
+  const naiBody = anonSanitize(await readJson<any>(request), c);
+  const started = Date.now(), requestId = crypto.randomUUID();
+  const quota = await anonReserve(env, request, c);
+  let resp: Response, account = "", accountId: number | null = null;
+  try {
+    ({ resp, account, accountId } = await generateViaPool(env, naiBody));
+  } catch (e) {
+    await refundBuckets(env, quota.taken);   // 账号池/上游故障不扣访客额度
+    await logGatewayRequest(env, { requestId, keyId: 0, accountId: null, path: "/anon/generate", mode: "anon", model: naiBody.model, status: e instanceof HttpError ? e.status : 500, ok: false, started, bytesIn: 0 });
+    throw e;
+  }
+  if (!resp.ok && resp.status >= 500) await refundBuckets(env, quota.taken);
+  // 计费检查与日志在后台做（流式扫描 cost_gems，不整段解析图片 JSON），图片同时直接转给访客
+  let body = resp.body, tap: ReadableStream<Uint8Array> | null = null;
+  if (resp.ok && body) [body, tap] = body.tee();
+  const finish = (async () => {
+    const cost = resp.ok ? await scanCostGems(tap) : null;
+    if (cost != null && cost > 0) {
+      // 熔断：免费档约束失效（上游规则变化等），立刻关闭匿名模式，避免持续消耗账号池 Gems
+      await saveAnonConfig(env, { enabled: false, disabled_reason: `访客请求被上游计费 ${cost} Gems（模型 ${naiBody.model}，${naiBody.parameters.width}×${naiBody.parameters.height}，${naiBody.parameters.steps} 步），已自动关闭匿名模式`, disabled_at: nowIso() }).catch(() => {});
+      console.error("[anon] circuit breaker tripped, cost_gems=", cost);
+    }
+    await logGatewayRequest(env, { requestId, keyId: 0, accountId, path: "/anon/generate", mode: "anon", model: naiBody.model, status: resp.status, ok: resp.ok, started, bytesIn: 0, cost });
+  })().catch(() => {});
+  if (ctx) ctx.waitUntil(finish); else await finish;
+  const out = await forward(new Response(body, resp));
+  const h = new Headers(out.headers);
+  h.set("X-Anon-Remaining-Today", String(await quota.dayLeft()));
+  return new Response(out.body, { status: out.status, statusText: out.statusText, headers: h });
+}
+async function anonAdminView(env: Env) {
+  const c = await getAnonConfig(env), day = await anonDay(env);
+  let used = 0, visitors = 0;
+  try {
+    used = Number((await env.DB.prepare("SELECT count FROM anon_usage WHERE bucket=?").bind(`g:${day}`).first<any>())?.count || 0);
+    visitors = Number((await env.DB.prepare("SELECT COUNT(*) c FROM anon_usage WHERE bucket LIKE 'd:%' AND bucket LIKE ? AND count>0").bind(`%:${day}`).first<any>())?.c || 0);
+  } catch { /* 未迁移 */ }
+  return { ...c, free_models: ANON_FREE_MODELS, max_steps: ANON_MAX_STEPS, max_pixels: ANON_MAX_PIXELS, today: { date: day, used, visitors, global_left: Math.max(0, c.global_daily - used) } };
+}
+
 /* ================= Prompt API（Nai2API 中文转 NAI 提示词） ================= */
 const PROMPT_SYSTEM_MESSAGE = `You are a specialist at converting Chinese image requests into precise NovelAI Diffusion prompts.
 
@@ -1688,13 +1848,13 @@ async function tokensRoute(request: Request, env: Env, rest: string) {
 
 // 定期清理：过期计数桶 / 并发租约，以及超过保留期的请求日志、重试记录、签到日志、每日用量。
 // 每次 cron 每张表最多删 5000 行，存量很大时分多次慢慢删完，不会单次跑太久。
-function clampInt(v: unknown, min: number, max: number, fallback: number) { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback; }
 async function pruneData(env: Env) {
   const now = nowIso();
   const days = clampInt(env.LOG_RETENTION_DAYS, 1, 3650, 30);
   const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
   const usageCutoff = new Date(Date.now() - Math.max(days, 90) * 86_400_000).toISOString().slice(0, 10);
   const jobs: [string, string][] = [
+    ["DELETE FROM anon_usage WHERE expires_at<?", now],
     ["DELETE FROM concurrency_leases WHERE expires_at<?", now],
     ["DELETE FROM request_attempts WHERE rowid IN (SELECT rowid FROM request_attempts WHERE created_at<? LIMIT 5000)", cutoff],
     ["DELETE FROM request_logs WHERE rowid IN (SELECT rowid FROM request_logs WHERE created_at<? LIMIT 5000)", cutoff],
@@ -1721,11 +1881,18 @@ export default {
         try { accounts = (await env.DB.prepare("SELECT COUNT(*) AS c FROM accounts").first<any>())?.c || 0; } catch { /* D1 未迁移时仍能响应 */ }
         const admin = isAdmin(request, env);
         response = json({ configured: Boolean(env.YESNAI_JWT) || accounts > 0, accounts: admin ? accounts : undefined,
-          access_key_required: Boolean(env.APP_ACCESS_KEY), admin_authenticated: admin });
+          access_key_required: Boolean(env.APP_ACCESS_KEY), admin_authenticated: admin, anon: anonPublic(await getAnonConfig(env)) });
+      }
+      else if (path.startsWith("/api/") && !isAdmin(request, env)) {
+        // 未带（或带错）访问密钥：只有匿名模式开放的两个入口可用，其余一律 401
+        if (path === "/api/yesnai/models" && request.method === "GET") response = await anonModels(env);
+        else if (path === "/api/yesnai/generate" && request.method === "POST") response = await anonGenerate(request, env, ctx);
+        else throw new HttpError("需要访问密钥（在设置里填写 APP_ACCESS_KEY）", 401, "ACCESS_KEY_REQUIRED");
       }
       else if (path.startsWith("/api/")) {
-        requireAccessKey(request, env);
-        if (path === "/api/stats" && request.method === "GET") response = await statsRoute(request, env, "stats");
+        if (path === "/api/anon/config" && request.method === "GET") response = json(await anonAdminView(env));
+        else if (path === "/api/anon/config" && request.method === "PUT") { requireOrigin(request, env); await saveAnonConfig(env, await readJson<any>(request)); response = json(await anonAdminView(env)); }
+        else if (path === "/api/stats" && request.method === "GET") response = await statsRoute(request, env, "stats");
         else if (path === "/api/logs" && request.method === "GET") response = await statsRoute(request, env, "logs");
         else if (path.startsWith("/api/ai/") && request.method !== "DELETE") response = await imageToolRoute(request, env, path.slice("/api/ai/".length));
         else if (path === "/api/prompt/status" && request.method === "GET") response = json(await promptApiStatus(env));

@@ -340,6 +340,18 @@ footer{text-align:center;padding:26px 20px 34px;color:var(--ink-faint);font-size
 .awb-diff .add{color:var(--ok)}
 .awb-diff .del{color:var(--err);text-decoration:line-through}
 .awb-diff .keep{color:var(--ink-faint);margin-top:6px}
+/* 访客（匿名模式）：隐藏所有需要管理员密钥的入口 */
+body.guest #balChip,body.guest #checkinBtn,body.guest #acctChip,body.guest #acctSel,body.guest #statsBtn,body.guest #imageToolsBtn,
+body.guest #quoteBtn,body.guest #promptConvertBtn,body.guest #advBox,body.guest #galFilters,body.guest #galFoot,
+body.guest #acctSec,body.guest #regSec,body.guest #walletSec,body.guest #tokSec,body.guest #gatewaySec,body.guest #promptApiSec,
+body.guest #autoSec,body.guest #gallerySec,body.guest #anonSec,body.guest #helpSec,body.guest .preset.over{display:none!important}
+.guest-banner{margin:-4px 0 14px;padding:10px 12px;border-radius:var(--r-sm);border:1px solid rgba(124,108,255,.35);background:rgba(124,108,255,.10);font-size:12.5px;line-height:1.6;color:var(--ink-dim)}
+.guest-banner b{color:var(--ink)}
+.guest-banner .notice{display:block;margin-top:4px;color:var(--ink)}
+.guest-banner .left{font-family:var(--mono);color:var(--ok)}
+.guest-banner a{color:var(--acc-b);cursor:pointer;text-decoration:underline}
+#anonModels label{display:flex;gap:6px;align-items:center;font-size:12.5px;color:var(--ink-dim)}
+.anon-warn{color:var(--err)!important}
 #artistWorkbenchModal .box{position:relative}
 #artistWorkbenchModal .close{position:absolute;top:12px;right:12px;float:none;z-index:2;padding:8px;min-width:40px;min-height:40px}
 @media(max-width:1100px){#artistWorkbenchModal .box{overflow:hidden}.awb{display:flex;flex-direction:column;min-height:0}.awb-col{display:none;overflow-y:auto;padding-right:0}.awb-col[data-col="editor"]{display:flex}.awb-mobile-tabs{display:flex!important}.awb-col[data-col="library"],.awb-col[data-col="assistant"]{flex:1}}
@@ -389,6 +401,7 @@ footer{text-align:center;padding:26px 20px 34px;color:var(--ink-faint);font-size
   <section>
     <div class="card">
       <h2>创作参数</h2>
+      <div class="guest-banner" id="guestBanner" hidden></div>
 
       <label class="f" style="margin-bottom:12px"><span>模型</span>
         <select id="model"></select>
@@ -686,6 +699,20 @@ footer{text-align:center;padding:26px 20px 34px;color:var(--ink-faint);font-size
       <p class="muted" id="cloudState">配置状态读取中…</p>
     </div>
 
+    <div class="sec" id="anonSec" style="display:none"><h4>匿名模式 · 访客免费生图</h4>
+      <label class="switch" style="margin-bottom:10px"><input type="checkbox" id="anonEnabled"><i></i>允许访客不填密钥直接生图（仅免费档）</label>
+      <div class="grid3">
+        <label class="f"><span>每 IP 每分钟（张）</span><input type="number" id="anonPerMin" min="1" max="60" value="3"></label>
+        <label class="f"><span>每 IP 每天（张）</span><input type="number" id="anonPerDay" min="1" max="10000" value="20"></label>
+        <label class="f"><span>全站每天（张）</span><input type="number" id="anonGlobal" min="1" max="1000000" value="300"></label>
+      </div>
+      <div class="row" id="anonModels" style="margin-top:10px;gap:14px;flex-wrap:wrap"></div>
+      <label class="f" style="margin-top:10px"><span>给访客的公告（可选，≤300 字）</span><textarea id="anonNotice" style="min-height:48px" maxlength="300" placeholder="例如：额度每天 0 点重置，请勿刷图"></textarea></label>
+      <div class="row" style="margin-top:10px"><button class="btn primary small" id="anonSave" type="button">保存匿名设置</button><span class="muted" id="anonToday"></span></div>
+      <p class="muted" id="anonState" style="margin-top:8px"></p>
+      <p class="muted" style="margin-top:6px">访客只能用免费模型、≤28 步、≤1024×1024 像素、单张纯文生图，图片不进云端画廊。若上游意外对访客请求计费，系统会立即自动关闭匿名模式并在这里显示原因，复核后手动重新开启即可。</p>
+    </div>
+
     <div class="sec" id="acctSec" style="display:none"><h4>云端账号 · 多账号中转</h4>
       <div id="acctList"></div>
       <div class="row" style="margin-top:6px">
@@ -909,6 +936,8 @@ const S = {
   jwtLocal: localStorage.getItem("ynai_st_jwt") || "",
   needAkey: false,
   admin: true,    // 云端：带对访问密钥（或未设密钥）= 站长；本地模式恒为 true
+  guest: false,   // 云端：没密钥但站长开了匿名模式 = 访客（只能免费档文生图）
+  anon: null,     // /api/session 下发的匿名模式公开配置
   user: "", uid: "", authenticated: false,
   cloud: false,   // 由启动探测决定：wrangler/部署环境 true，serve.py/file:// false
   promptVersion: localStorage.getItem("ynai_st_pver") || "v5",  models: [], accounts: [],
@@ -979,6 +1008,7 @@ async function api(path, {method="GET", body=null, form=null, auth="none", timeo
   try{
     res = await fetch(targetPath, {method, headers, credentials:"include",
       body: form || (body !== null ? JSON.stringify(body) : undefined), signal: ac.signal});
+    api.lastHeaders = res.headers;
   }catch(e){
     throw new Error(e.name === "AbortError"
       ? `请求超时（${Math.round(timeoutMs/1000)}s）`
@@ -1130,7 +1160,9 @@ async function buildBody(){
   if (isV3){ p.sm = $("sm").checked; p.sm_dyn = $("smdyn").checked; }
 
   let action = "generate";
-  if (S.infillImg && S.infillMask){
+  if (S.guest){
+    // 访客：纯文生图，不带底图 / 蒙版 / 参考图 / 附加 JSON
+  } else if (S.infillImg && S.infillMask){
     action = "infill";
     p.image = S.infillImg; p.mask = S.infillMask;
     p.inpaintImg2ImgStrength = +$("strength").value;
@@ -1140,8 +1172,8 @@ async function buildBody(){
     p.strength = +$("strength").value; p.noise = 0.07;
     p.img2img = {color_correct:true, strength:+$("strength").value};
   }
-  refUiValidateAndInject(p);
-  const extra = $("extra").value.trim();
+  if (!S.guest) refUiValidateAndInject(p);
+  const extra = S.guest ? "" : $("extra").value.trim();
   if (extra){
     try{ Object.assign(p, JSON.parse(extra)); }
     catch(e){ throw new Error("附加参数不是合法 JSON：" + e.message); }
@@ -1177,7 +1209,7 @@ async function quote(){
 async function generate(){
   if (S.genBusy) return;
   if (!S.cloud && !S.token) return openSettings("生图前请先填写 API Token");
-  if (S.cloud && !S.admin) return openSettings("请先在设置里填写访问密钥");
+  if (S.cloud && !S.admin && !S.guest) return openSettings("请先在设置里填写访问密钥");
   // 模型列表可能因启动时网络/密钥问题没拉到：生成前现场补拉一次
   if (!$("model").value){
     await loadModels();
@@ -1185,6 +1217,7 @@ async function generate(){
   }
   let body;
   try{ body = await buildBody(); }catch(e){ return toast(e.message,"err"); }
+  if (S.guest){ try{ guestCheck(body); }catch(e){ return toast(e.message, "err"); } }
   if (body.action==="infill" && !body.model.endsWith("-inpainting")){
     const want = body.model + "-inpainting";
     if (S.models.includes(want)){ body.model = want; toast("已自动切换到重绘模型：" + want, "warn"); }
@@ -1201,7 +1234,7 @@ async function generate(){
     const cost = r.job?.cost_gems;
     if (!imgs.length) throw new Error(r.job?.status ? ("任务状态：" + r.job.status) : "响应中没有图片");
     const sec = ((performance.now()-t0)/1000).toFixed(1);
-    const auto = localStorage.getItem(LS.galauto) !== "0";
+    const auto = !S.guest && localStorage.getItem(LS.galauto) !== "0";   // 访客图片不进云端画廊
     const baseMeta = {
       prompt: body.input, promptBase: body.promptBase, artist: body.artist, artistId: body.artistInfo?.id || "", artistName: body.artistInfo?.name || "", final_prompt: body.input, neg: body.parameters.negative_prompt || "", model: body.model, promptHash: body.promptHash || "", snapshotId: body.snapshotId || "",
       seed: body.parameters.seed, w: body.parameters.width, h: body.parameters.height,
@@ -1223,7 +1256,8 @@ async function generate(){
     }
     $("costHint").innerHTML = `✦ 完成，用时 ${sec}s · 扣费 <b>${cost ?? "?"} Gems</b>` + (r.image_format ? ` · ${esc(fmt.toUpperCase())}` : "");
     toast(`生成成功：${imgs.length} 张 · ${cost ?? "?"} Gems · ${sec}s` + (auto ? " · 已入画廊" : ""), "ok");
-    if (S.cloud || S.user) refreshBalance(true);
+    if (S.guest){ const left = api.lastHeaders?.get("X-Anon-Remaining-Today"); if (left != null) guestBannerRender(+left); }
+    else if (S.cloud || S.user) refreshBalance(true);
   }catch(e){
     $("costHint").textContent = "";
     toast("生成失败：" + e.message + (e.hint?`（${e.hint}）`:""), "err");
@@ -1392,13 +1426,13 @@ function galRender(){
   const viewItems=gal.items.filter(galItemMatches); grid.innerHTML = "";
   galUpdateModelFilter(gal.items);
   if (!viewItems.length){
-    grid.innerHTML = `<div class="empty"><div class="big">✦</div>还没有作品<br>填好提示词，点击「生成」开始创作<br><span class="muted">NAI 4.5 系列与 NAI 5 Curated 免费 · 生成的图会自动存入画廊</span></div>`;
+    grid.innerHTML = `<div class="empty"><div class="big">✦</div>还没有作品<br>填好提示词，点击「生成」开始创作<br><span class="muted">${S.guest ? "访客生成的图片只在当前页面显示，刷新即消失，请及时下载" : "NAI 4.5 系列与 NAI 5 Curated 免费 · 生成的图会自动存入画廊"}</span></div>`;
   } else for (const it of viewItems) grid.appendChild(galCard(it));
   galCountUpdate();
   $("galFoot").style.display = gal.offset < gal.total ? "" : "none";
 }
 async function galLoadMore(){
-  if (gal.busy || (S.cloud && !S.admin)) return;   // 未授权没有云端画廊
+  if (gal.busy || (S.cloud && !S.admin)) return;   // 访客 / 未授权没有云端画廊
   gal.busy = true;
   try{
     if (S.cloud){
@@ -1489,7 +1523,7 @@ async function publishUndo(){
 }
 async function galRemove(item, el){
   try{
-    // 未入库的临时图（关闭自动入库 / 入库失败）只从页面移除，不请求删除接口
+    // 未入库的临时图（访客 / 关闭自动入库 / 入库失败）只从页面移除，不请求删除接口
     if (String(item.id).startsWith("tmp_")) {}
     else if (S.cloud) await api("/api/gallery/" + encodeURIComponent(item.id), {method:"DELETE"});
     else await idbTx("readwrite", st=>st.delete(item.id));
@@ -1652,27 +1686,92 @@ function cloudSession(r){
   if (!$('cloudState')) return;
   S.needAkey = !!r?.access_key_required;
   const n = r?.accounts ?? (r?.configured ? 1 : 0);
-  if (!S.admin) $('cloudState').textContent = S.akey ? '⚠ 访问密钥不正确' : '⚠ 需要访问密钥（向站长索取）';
+  if (S.guest) $('cloudState').textContent = '访客模式：可直接免费生图（免费模型 · ≤28 步 · ≤1024×1024 · 单张）。站长填入访问密钥后解锁全部功能。';
+  else if (!S.admin) $('cloudState').textContent = S.akey ? '⚠ 访问密钥不正确' : '⚠ 需要访问密钥（向站长索取）';
   else $('cloudState').textContent = r?.configured ? `✓ 云端已就绪 · ${n} 个账号接入` : '✗ 尚无账号——在下方添加，或配置 YESNAI_JWT Secret 引导';
   if (S.admin) promptApiRefresh();
 }
 
-/* ================= 访问状态 ================= */
-// 根据 /api/session 判定身份：站长（admin，密钥正确或未设密钥）/ 锁定（需要密钥）
+/* ================= 访问状态 · 匿名模式 ================= */
+// 根据 /api/session 判定身份：站长（admin）/ 访客（guest，匿名模式开启时）/ 锁定（需要密钥）
 function applyAccess(r){
-  if (!S.cloud){ S.admin = true; return; }
-  const wasAdmin = S.admin;
+  if (!S.cloud){ S.admin = true; S.guest = false; S.anon = null; document.body.classList.remove("guest"); return; }
+  const wasGuest = S.guest, wasAdmin = S.admin;
   S.needAkey = !!r?.access_key_required;
+  S.anon = r?.anon || null;
   S.admin = !S.needAkey || r?.admin_authenticated === true;
+  S.guest = !S.admin && !!S.anon?.enabled;
+  document.body.classList.toggle("guest", S.guest);
+  guestApplyLimits();
+  guestBannerRender();
   modeUI();
-  return wasAdmin !== S.admin;   // 身份变了，调用方据此重载数据
+  if (wasGuest !== S.guest || wasAdmin !== S.admin) return true;   // 身份变了，调用方据此重载数据
+  return false;
+}
+function guestBannerRender(remaining){
+  const el = $("guestBanner"); if (!el) return;
+  el.hidden = !S.guest;
+  if (!S.guest) return;
+  const a = S.anon || {};
+  if (remaining != null) a.remaining = remaining;
+  const left = a.remaining != null ? ` · 今日剩余 <span class="left">${esc(String(a.remaining))}</span> 张` : ` · 每天 ${esc(String(a.per_ip_daily ?? "?"))} 张`;
+  el.innerHTML = `<b>访客模式 · 免费档</b>${left}<br>仅免费模型 · ≤${esc(String(a.max_steps ?? 28))} 步 · ≤1024×1024 像素 · 单张文生图；图片只在本页显示，刷新即消失，请及时下载。` +
+    (a.notice ? `<span class="notice">📢 ${esc(a.notice)}</span>` : "") + ` <a id="guestAdminLink">站长登录</a>`;
+  const link = $("guestAdminLink"); if (link) link.onclick = ()=>openSettings();
+}
+// 访客：把表单约束到免费档；回到站长身份时恢复
+function guestApplyLimits(){
+  const maxSteps = S.guest ? (S.anon?.max_steps || 28) : 50;
+  const maxPx = S.guest ? (S.anon?.max_pixels || 1048576) : Infinity;
+  for (const id of ["steps", "stepsR"]) { const el = $(id); if (el) el.max = String(maxSteps); }
+  if (S.guest && $("steps") && +$("steps").value > maxSteps){ $("steps").value = String(maxSteps); if ($("stepsR")) $("stepsR").value = String(maxSteps); if ($("stepsEcho")) $("stepsEcho").textContent = String(maxSteps); }
+  if ($("n")){ $("n").disabled = S.guest; if (S.guest){ $("n").value = "1"; if ($("nEcho")) $("nEcho").textContent = "1"; } }
+  document.querySelectorAll("#presets .preset").forEach(p=>p.classList.toggle("over", (+p.dataset.w) * (+p.dataset.h) > maxPx));
+  if (S.guest && $("w") && $("h") && (+$("w").value) * (+$("h").value) > maxPx){ $("w").value = "832"; $("h").value = "1216"; syncSizeEcho(); }
+}
+// 访客请求在本地先过一遍免费档规则，省得白跑一趟服务端
+function guestCheck(body){
+  const a = S.anon || {}, p = body.parameters;
+  if (body.action !== "generate") throw new Error("访客模式只支持文生图");
+  if (Array.isArray(a.models) && !a.models.includes(body.model)) throw new Error("访客模式只能用免费模型");
+  if (p.steps > (a.max_steps || 28)) throw new Error(`访客模式步数上限 ${a.max_steps || 28}`);
+  if (p.width * p.height > (a.max_pixels || 1048576)) throw new Error("访客模式尺寸上限 1024×1024 像素（如 832×1216、1024×1024）");
+  p.n_samples = 1;
+}
+async function anonLoad(){
+  if (!S.cloud || !S.admin || !$("anonSec")) return;
+  try{
+    const c = await api("/api/anon/config");
+    $("anonEnabled").checked = !!c.enabled;
+    $("anonPerMin").value = c.per_ip_per_minute; $("anonPerDay").value = c.per_ip_daily; $("anonGlobal").value = c.global_daily;
+    $("anonNotice").value = c.notice || "";
+    $("anonModels").innerHTML = (c.free_models || []).map(m=>`<label><input type="checkbox" value="${esc(m)}"${(c.models||[]).includes(m) ? " checked" : ""}>${esc(label(m).replace(/\s*〔免费〕/, ""))}</label>`).join("");
+    const t = c.today || {};
+    $("anonToday").textContent = `今日：${t.used ?? 0}/${c.global_daily} 张 · ${t.visitors ?? 0} 位访客`;
+    const st = $("anonState");
+    st.classList.toggle("anon-warn", !!c.disabled_reason);
+    st.textContent = c.disabled_reason ? `⚠ ${c.disabled_reason}（${String(c.disabled_at || "").slice(0,16).replace("T"," ")}）` : (c.enabled ? "✓ 匿名模式已开启，访客打开页面即可生图" : "匿名模式未开启：没有访问密钥的人无法使用");
+  }catch(e){ $("anonState").textContent = "读取失败：" + e.message + (e.status === 503 || /no such table/i.test(e.message) ? "（请先执行数据库迁移 0015）" : ""); }
+}
+async function anonSave(){
+  const btn = $("anonSave"); btn.disabled = true;
+  try{
+    const models = [...$("anonModels").querySelectorAll("input:checked")].map(x=>x.value);
+    if (!models.length) throw new Error("至少保留一个免费模型");
+    await api("/api/anon/config", {method:"PUT", body:{
+      enabled: $("anonEnabled").checked, models, notice: $("anonNotice").value.trim(),
+      per_ip_per_minute: +$("anonPerMin").value, per_ip_daily: +$("anonPerDay").value, global_daily: +$("anonGlobal").value,
+    }});
+    toast("匿名设置已保存", "ok"); anonLoad();
+  }catch(e){ toast("保存失败：" + e.message, "err"); }
+  finally{ btn.disabled = false; }
 }
 // 身份变化后重载与身份相关的数据（模型列表、画廊、账号等）
 function accessReload(){
   loadModels();
   galRevoke(); gal.items = []; gal.offset = 0; gal.total = -1; galRender();
   if (!S.cloud || S.admin) galLoadMore();
-  if (S.cloud && S.admin){ acctLoad(); refreshBalance(true); acRefresh(); tokLoad(); gatewayLoad(); }
+  if (S.cloud && S.admin){ acctLoad(); refreshBalance(true); acRefresh(); tokLoad(); gatewayLoad(); anonLoad(); }
 }
 async function promptApiRefresh(){
   const sec = $('promptApiSec'); if (!sec) return;
@@ -2377,9 +2476,9 @@ function openSettings(tip){
   if (tip) toast(tip, "warn");
   if ($("galStore")) $("galStore").textContent = S.cloud ? "云端画廊存 Cloudflare R2" : "本地画廊存浏览器 IndexedDB";
   if (S.cloud) api("/api/session").then(r=>{ if (applyAccess(r)) accessReload(); cloudSession(r); }).catch(()=>{});
-  if (S.cloud && !S.admin) return;   // 未授权：只显示访问密钥区块，不发管理接口请求
+  if (S.cloud && !S.admin) return;   // 访客 / 未授权：只显示访问密钥区块，不发管理接口请求
   acRefresh();
-  if (S.cloud) acctLoad();
+  if (S.cloud){ acctLoad(); anonLoad(); }
   regLoad();
   walLoad();   // 已登录才拉钱包/签到数据；未登录只切换到登录态，不发请求
 }
@@ -2387,16 +2486,16 @@ function saveSettings(){
   if (S.cloud){
     S.akey = $("cfgAkey").value.trim();
     save("ynai_st_akey", S.akey);
-    // 重新判定身份：密钥正确 → 站长，解锁并重载全部数据；不正确 → 保持锁定
+    // 重新判定身份：密钥正确 → 站长，解锁并重载全部数据；不正确 → 保持访客/锁定
     api("/api/session").then(r=>{
       const changed = applyAccess(r);
       S.authenticated = !!r.configured && S.admin; S.user = S.authenticated ? "云端多账号" : "";
       cloudSession(r); loginUI();
       if (changed) accessReload();
       else if (S.admin){ acctLoad(); if (!S.models.length) loadModels(); refreshBalance(true); }
-      if (S.akey && !S.admin) toast("访问密钥不正确", "err");
+      if (S.akey && !S.admin) toast(S.guest ? "访问密钥不正确，当前仍是访客模式" : "访问密钥不正确", "err");
       else if (S.admin && changed) toast("已进入站长模式 ✦", "ok");
-      if (S.admin && $("setModal").classList.contains("on")){ acRefresh(); regLoad(); walLoad(); }
+      if (S.admin && $("setModal").classList.contains("on")){ acRefresh(); anonLoad(); regLoad(); walLoad(); }
     }).catch(e=>toast("会话查询失败：" + e.message, "err"));
     return;
   }
@@ -3320,6 +3419,7 @@ async function awbAiRun(){
 async function awbAiCheck(){
   const note=$("awbAiNote"), st=$("awbAiState"), run=$("awbAiRun");
   run.disabled=true; st.textContent="检查中…";
+  if (S.guest){ note.textContent="访客模式不提供 AI 建议；体检和找画师可正常使用。"; note.className="awb-note warn"; note.style.display=""; st.textContent="访客"; return; }
   try { const r=await api("/api/prompt/status"); if(!r?.configured){note.textContent="AI 建议需要配置 Prompt API；体检和找画师无需 AI。";note.className="awb-note warn";note.style.display="";st.textContent="未配置";return;} note.textContent="AI 已就绪：建议将逐项显示，可单独采纳。";note.className="awb-note ok";note.style.display="";st.textContent="模型 "+(r.model||"?");run.disabled=false; }
   catch(e){note.textContent="AI 暂不可用："+(e.hint||e.message||"请检查设置");note.className="awb-note warn";note.style.display="";st.textContent="不可用";}
 }
@@ -3354,6 +3454,7 @@ function modeUI(){
   if (ts) ts.style.display = S.cloud ? "" : "none";
   if (gs) gs.style.display = S.cloud ? "" : "none";
   if (ps) ps.style.display = "";
+  if ($("anonSec")) $("anonSec").style.display = S.cloud && S.admin ? "" : "none";
   if (rs){
     rs.style.display = "";   // 注册/导入：本地与云端模式均显示
     if ($("impGo")) $("impGo").textContent = S.cloud ? "📥 一键导入（加入账户集合）" : "📥 一键导入（加入本地账号）";
@@ -3435,14 +3536,14 @@ document.addEventListener("DOMContentLoaded", async ()=>{
   restoreForm(); renderHist();
   artistSeed(); artistRender();
   setRender();
-  // 云端先判定身份（站长 / 需密钥），再按身份加载模型与画廊，避免未授权时启动一串 401
+  // 云端先判定身份（站长 / 访客 / 需密钥），再按身份加载模型与画廊，避免访客启动时一串 401
   if (S.cloud) await appSession();
   loadModels();
   galRender();
   if (!S.cloud || S.admin) galLoadMore();
   if (S.cloud) {
     if (S.admin) { refreshBalance(true); acRefresh(); tokLoad(); gatewayLoad(); }
-    else setTimeout(()=>openSettings("请先填写访问密钥（向站长索取）"), 1900);
+    else if (!S.guest) setTimeout(()=>openSettings("请先填写访问密钥（向站长索取）"), 1900);
   }
   else {
     S.authenticated = !!S.jwtLocal; S.user = S.authenticated ? (localStorage.getItem("ynai_st_user")||"") : "";
@@ -3531,6 +3632,7 @@ document.addEventListener("DOMContentLoaded", async ()=>{
   $("galAuto").onchange = e=>save(LS.galauto, e.target.checked ? "1" : "0");
   if ($('cfgAkey')) $('cfgAkey').onchange = saveSettings;
   if ($('cfgAkeySaveBtn')) $('cfgAkeySaveBtn').onclick = () => saveSettings();
+  if ($('anonSave')) $('anonSave').onclick = anonSave;
   if ($('promptConvertBtn')) $('promptConvertBtn').onclick = openPromptConvert;
   if ($('promptConvertSubmitBtn')) $('promptConvertSubmitBtn').onclick = convertPrompt;
   if ($('promptApiModels')) $('promptApiModels').onclick = promptApiModels;
